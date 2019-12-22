@@ -80,5 +80,7 @@ class MetricsLambda(Metric):
         self._internal_attach(engine)
 
         completed_event = self._trigger_events["completed"]
+        # Handle engine started event
+        engine.add_event_handler(Events.STARTED, self.on_engine_start, name)
         # Attach event handler for metric computation
         engine.add_event_handler(completed_event, self.on_completed, name)

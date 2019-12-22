@@ -122,6 +122,12 @@ class Metric(with_metaclass(ABCMeta, object)):
             return tensor.item()
         return tensor
 
+    def on_engine_start(self, engine, name):
+        # Store metrics metadata to engine state
+        engine.state.metrics_meta[name] = {
+            "trigger_events": self._trigger_events
+        }
+
     def on_start(self, engine):
         self.reset()
 
@@ -141,6 +147,8 @@ class Metric(with_metaclass(ABCMeta, object)):
         update_event = self._trigger_events.get("update", completed_event)
         started_event = self._trigger_events.get("start")
         
+        # Handle engine started event
+        engine.add_event_handler(Events.STARTED, self.on_engine_start, name)
         # Handle started event
         if started_event and not engine.has_event_handler(self.on_start, started_event):
             engine.add_event_handler(started_event, self.on_start)

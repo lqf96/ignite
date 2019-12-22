@@ -643,7 +643,7 @@ class Engine(object):
 
         """
 
-        self.state = State(dataloader=data, max_epochs=max_epochs, metrics={})
+        self.state = State(dataloader=data, max_epochs=max_epochs, metrics={}, metrics_meta={})
         self.should_terminate = self.should_terminate_single_epoch = False
 
         try:
