@@ -14,6 +14,11 @@ import torch.distributed as dist
 from ignite._six import with_metaclass
 from ignite.engine import Events
 
+DEFAULT_TRIGGER_EVENTS = {
+    "start": Events.EPOCH_STARTED,
+    "update": Events.ITERATION_COMPLETED,
+    "completed": Events.EPOCH_COMPLETED
+}
 
 class Metric(with_metaclass(ABCMeta, object)):
     """
@@ -28,11 +33,17 @@ class Metric(with_metaclass(ABCMeta, object)):
             In most of the cases, it can be defined as "cuda:local_rank" or "cuda"
             if already set `torch.cuda.set_device(local_rank)`. By default, if a distributed process group is
             initialized and available, device is set to `cuda`.
-
     """
 
-    def __init__(self, output_transform=lambda x: x, device=None):
+    def __init__(self, output_transform=lambda x: x, device=None, trigger_events=DEFAULT_TRIGGER_EVENTS):
         self._output_transform = output_transform
+
+        # Convert trigger events to dictionary
+        if not isinstance(trigger_events, dict):
+            trigger_events = {"completed": trigger_events}
+        # Trigger event for metric computation must be provided
+        if "completed" not in trigger_events:
+            raise ValueError("trigger event for metric computation must be provided")
 
         # Check device if distributed is initialized:
         if dist.is_available() and dist.is_initialized():
@@ -45,14 +56,15 @@ class Metric(with_metaclass(ABCMeta, object)):
             if device is None:
                 device = "cuda"
             device = torch.device(device)
+
         self._device = device
         self._is_reduced = False
+        self._trigger_events = trigger_events
         self.reset()
 
-    @abstractmethod
     def reset(self):
         """
-        Resets the metric to it's initial state.
+        Resets the metric to its initial state.
 
         This is called at the start of each epoch.
         """
@@ -110,26 +122,33 @@ class Metric(with_metaclass(ABCMeta, object)):
             return tensor.item()
         return tensor
 
-    def started(self, engine):
+    def on_start(self, engine):
         self.reset()
 
     @torch.no_grad()
-    def iteration_completed(self, engine):
+    def on_update(self, engine):
         output = self._output_transform(engine.state.output)
         self.update(output)
 
-    def completed(self, engine, name):
+    def on_completed(self, engine, name):
         result = self.compute()
         if torch.is_tensor(result) and len(result.shape) == 0:
             result = result.item()
         engine.state.metrics[name] = result
 
     def attach(self, engine, name):
-        engine.add_event_handler(Events.EPOCH_COMPLETED, self.completed, name)
-        if not engine.has_event_handler(self.started, Events.EPOCH_STARTED):
-            engine.add_event_handler(Events.EPOCH_STARTED, self.started)
-        if not engine.has_event_handler(self.iteration_completed, Events.ITERATION_COMPLETED):
-            engine.add_event_handler(Events.ITERATION_COMPLETED, self.iteration_completed)
+        completed_event = self._trigger_events["completed"]
+        update_event = self._trigger_events.get("update", completed_event)
+        started_event = self._trigger_events.get("start")
+        
+        # Handle started event
+        if started_event and not engine.has_event_handler(self.on_start, started_event):
+            engine.add_event_handler(started_event, self.on_start)
+        # Handle update event
+        if not engine.has_event_handler(self.on_update, update_event):
+            engine.add_event_handler(update_event, self.on_update)
+        # Handle completed event
+        engine.add_event_handler(completed_event, self.on_completed, name)
 
     def __add__(self, other):
         from ignite.metrics import MetricsLambda
