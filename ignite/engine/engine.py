@@ -1,11 +1,11 @@
 import inspect
 import logging
 import sys
-import time
 from collections import defaultdict
 from enum import Enum
 import weakref
 import numbers
+import asyncio
 
 from ignite._utils import _to_hours_mins_secs
 
@@ -583,15 +583,21 @@ class Engine(object):
                           "Current epoch iteration will stop after current iteration is finished.")
         self.should_terminate_single_epoch = True
 
-    def _run_once_on_dataset(self):
-        start_time = time.time()
+    async def _run_once_on_dataset(self, loop):
+        start_time = loop.time()
 
         try:
             for batch in self.state.dataloader:
                 self.state.batch = batch
                 self.state.iteration += 1
                 self._fire_event(Events.ITERATION_STARTED)
-                self.state.output = self._process_function(self, self.state.batch)
+
+                # Call (and await for) process function
+                output = self._process_function(self, self.state.batch)
+                if inspect.isawaitable(output):
+                    output = await output
+                self.state.output = output
+
                 self._fire_event(Events.ITERATION_COMPLETED)
                 if self.should_terminate or self.should_terminate_single_epoch:
                     self.should_terminate_single_epoch = False
@@ -601,7 +607,7 @@ class Engine(object):
             self._logger.error("Current run is terminating due to exception: %s.", str(e))
             self._handle_exception(e)
 
-        time_taken = time.time() - start_time
+        time_taken = loop.time() - start_time
         hours, mins, secs = _to_hours_mins_secs(time_taken)
 
         return hours, mins, secs
@@ -612,8 +618,8 @@ class Engine(object):
         else:
             raise e
 
-    def run(self, data, max_epochs=1):
-        """Runs the `process_function` over the passed data.
+    async def run_async(self, data, max_epochs=1):
+        """Asynchronously runs the `process_function` over the passed data.
 
         Args:
             data (Iterable): Collection of batches allowing repeated iteration (e.g., list or `DataLoader`).
@@ -641,20 +647,23 @@ class Engine(object):
         self.should_terminate = self.should_terminate_single_epoch = False
 
         try:
+            # Current event loop
+            loop = asyncio.get_event_loop()
+
             self._logger.info("Engine run starting with max_epochs={}.".format(max_epochs))
-            start_time = time.time()
+            start_time = loop.time()
             self._fire_event(Events.STARTED)
             while self.state.epoch < max_epochs and not self.should_terminate:
                 self.state.epoch += 1
                 self._fire_event(Events.EPOCH_STARTED)
-                hours, mins, secs = self._run_once_on_dataset()
+                hours, mins, secs = await self._run_once_on_dataset(loop)
                 self._logger.info("Epoch[%s] Complete. Time taken: %02d:%02d:%02d", self.state.epoch, hours, mins, secs)
                 if self.should_terminate:
                     break
                 self._fire_event(Events.EPOCH_COMPLETED)
 
             self._fire_event(Events.COMPLETED)
-            time_taken = time.time() - start_time
+            time_taken = loop.time() - start_time
             hours, mins, secs = _to_hours_mins_secs(time_taken)
             self._logger.info("Engine run complete. Time taken %02d:%02d:%02d" % (hours, mins, secs))
 
@@ -663,3 +672,8 @@ class Engine(object):
             self._handle_exception(e)
 
         return self.state
+
+    def run(self, data, max_epochs=1):
+        loop = asyncio.new_event_loop()
+        # Wait until the engine coroutine completes
+        return loop.run_until_complete(self.run_async(data, max_epochs))
