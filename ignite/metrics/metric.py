@@ -20,6 +20,7 @@ DEFAULT_TRIGGER_EVENTS = {
     "completed": Events.EPOCH_COMPLETED
 }
 
+
 class Metric(metaclass=ABCMeta):
     """
     Base class for all Metrics.
@@ -39,7 +40,7 @@ class Metric(metaclass=ABCMeta):
     _required_output_keys = ("y_pred", "y")
 
     def __init__(self, output_transform: Callable = lambda x: x, device: Optional[Union[str, torch.device]] = None,
-        trigger_events: Dict[str, EventEnum] = DEFAULT_TRIGGER_EVENTS):
+                 trigger_events: Dict[str, EventEnum] = DEFAULT_TRIGGER_EVENTS):
         self._output_transform = output_transform
 
         # Convert trigger events to dictionary
@@ -182,7 +183,7 @@ class Metric(metaclass=ABCMeta):
         started_event = self._trigger_events.get("started")
 
         # Handle period started event
-        if started_event!=None and not engine.has_event_handler(self.started, started_event):
+        if started_event is not None and not engine.has_event_handler(self.started, started_event):
             engine.add_event_handler(started_event, self.started)
         # Handle period update event
         if not engine.has_event_handler(self.on_update, update_event):
@@ -221,7 +222,7 @@ class Metric(metaclass=ABCMeta):
         if engine.has_event_handler(self.completed, completed_event):
             engine.remove_event_handler(self.completed, completed_event)
         # Remove period started event handler
-        if started_event!=None and engine.has_event_handler(self.started, started_event):
+        if started_event is not None and engine.has_event_handler(self.started, started_event):
             engine.remove_event_handler(self.started, started_event)
         # Remove period completed event handler
         if engine.has_event_handler(self.on_update, update_event):
