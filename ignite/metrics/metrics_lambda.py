@@ -2,7 +2,7 @@ import itertools
 from typing import Callable, Any
 
 from ignite.metrics.metric import Metric, reinit__is_reduced
-from ignite.engine import Events, Engine
+from ignite.engine import Engine
 
 __all__ = ["MetricsLambda"]
 

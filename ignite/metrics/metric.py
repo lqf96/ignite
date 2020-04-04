@@ -235,7 +235,7 @@ class Metric(metaclass=ABCMeta):
         Args:
             engine (Engine): the engine checked from which the metric should be attached
         """
-        return engine.has_event_handler(self.completed, Events.EPOCH_COMPLETED)
+        return engine.has_event_handler(self.completed, self._trigger_events["completed"])
 
     def __add__(self, other):
         from ignite.metrics import MetricsLambda
