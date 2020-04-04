@@ -7,7 +7,7 @@ from ignite.metrics import Metric, Precision, Recall, ConfusionMatrix
 from ignite.metrics.metric import reinit__is_reduced
 from ignite.engine import Engine, State
 
-from mock import MagicMock
+from unittest.mock import MagicMock
 import pytest
 from pytest import approx, raises
 
@@ -15,21 +15,26 @@ import numpy as np
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 
 
+class DummyMetric1(Metric):
+    def __init__(self, true_output, output_transform=lambda x: x):
+        super(DummyMetric1, self).__init__(output_transform=output_transform)
+        self.true_output = true_output
+
+    def reset(self):
+        pass
+
+    def compute(self):
+        pass
+
+    def update(self, output):
+        assert output == self.true_output
+
+
 def test_no_transform():
     y_pred = torch.Tensor([[2.0], [-2.0]])
     y = torch.zeros(2)
 
-    class DummyMetric(Metric):
-        def reset(self):
-            pass
-
-        def compute(self):
-            pass
-
-        def update(self, output):
-            assert output == (y_pred, y)
-
-    metric = DummyMetric()
+    metric = DummyMetric1(true_output=(y_pred, y))
     state = State(output=(y_pred, y))
     engine = MagicMock(state=state)
     metric.iteration_completed(engine)
@@ -39,7 +44,31 @@ def test_transform():
     y_pred = torch.Tensor([[2.0], [-2.0]])
     y = torch.zeros(2)
 
+    def transform(output):
+        pred_dict, target_dict = output
+        return pred_dict["y"], target_dict["y"]
+
+    metric = DummyMetric1(true_output=(y_pred, y), output_transform=transform)
+    state = State(output=({"y": y_pred}, {"y": y}))
+    engine = MagicMock(state=state)
+    metric.iteration_completed(engine)
+
+
+def test_output_as_mapping_wrong_keys():
+    metric = DummyMetric1(true_output=(0, 1))
+    state = State(output=({"y1": 0, "y2": 1}))
+    engine = MagicMock(state=state)
+
+    with pytest.raises(
+        ValueError, match=r"When transformed engine's output is a mapping, " r"it should contain \('y_pred', 'y'\) keys"
+    ):
+        metric.iteration_completed(engine)
+
+
+def test_output_as_mapping_keys_is_none():
     class DummyMetric(Metric):
+        _required_output_keys = None
+
         def reset(self):
             pass
 
@@ -47,14 +76,23 @@ def test_transform():
             pass
 
         def update(self, output):
-            assert output == (y_pred, y)
+            pass
 
-    def transform(output):
-        pred_dict, target_dict = output
-        return pred_dict['y'], target_dict['y']
+    metric = DummyMetric()
+    assert metric._required_output_keys is None
+    state = State(output=({"y1": 0, "y2": 1}))
+    engine = MagicMock(state=state)
 
-    metric = DummyMetric(output_transform=transform)
-    state = State(output=({'y': y_pred}, {'y': y}))
+    with pytest.raises(TypeError, match=r"Transformed engine output for DummyMetric metric should be a tuple/list"):
+        metric.iteration_completed(engine)
+
+
+def test_output_as_mapping():
+    y_pred = torch.Tensor([[2.0], [-2.0]])
+    y = torch.zeros(2)
+
+    metric = DummyMetric1(true_output=(y_pred, y))
+    state = State(output=({"y_pred": y_pred, "y": y}))
     engine = MagicMock(state=state)
     metric.iteration_completed(engine)
 
@@ -84,7 +122,6 @@ def test_no_grad():
 
 def test_arithmetics():
     class ListGatherMetric(Metric):
-
         def __init__(self, index):
             self.index = index
             super(ListGatherMetric, self).__init__()
@@ -275,6 +312,43 @@ def test_attach():
     assert m2.compute_count == 10
     assert m2.update_count == 50
 
+    assert m1.is_attached(engine)
+    assert m2.is_attached(engine)
+
+
+def test_detach():
+    class DummyMetric(Metric):
+        _required_output_keys = None
+
+        def reset(self):
+            pass
+
+        def compute(self):
+            pass
+
+        def update(self, output):
+            pass
+
+    def process_function(*args, **kwargs):
+        return 1
+
+    engine = Engine(process_function)
+    m1 = DummyMetric()
+    m2 = DummyMetric()
+    m1.attach(engine, "m1")
+    m2.attach(engine, "m2_1")
+    m2.attach(engine, "m2_2")
+    m1.detach(engine)
+    m2.detach(engine)
+    engine.run(range(10), 5)
+
+    assert 'm1' not in engine.state.metrics
+    assert 'm2_1' not in engine.state.metrics
+    assert 'm2_2' not in engine.state.metrics
+
+    assert not m1.is_attached(engine)
+    assert not m2.is_attached(engine)
+
 
 def test_integration():
     np.random.seed(1)
@@ -317,9 +391,9 @@ def test_integration():
     recall_true = recall_score(y_true, np.argmax(y_pred, axis=-1), average=None)
     f1_true = f1_score(y_true, np.argmax(y_pred, axis=-1), average=None)
 
-    precision = state.metrics['precision'].numpy()
-    recall = state.metrics['recall'].numpy()
-    f1 = state.metrics['f1'].numpy()
+    precision = state.metrics["precision"].numpy()
+    recall = state.metrics["recall"].numpy()
+    f1 = state.metrics["f1"].numpy()
 
     assert precision_true == approx(precision), "{} vs {}".format(precision_true, precision)
     assert recall_true == approx(recall), "{} vs {}".format(recall_true, recall)
@@ -332,7 +406,6 @@ def test_abstract_class():
 
 
 def test_pytorch_operators():
-
     def _test(composed_metric, metric_name, compute_true_value_fn):
 
         metrics = {
@@ -356,9 +429,9 @@ def test_pytorch_operators():
                 yield (y_pred[i], y[i])
 
         d = data(y_pred, y)
-        state = validator.run(d, max_epochs=1)
+        state = validator.run(d, max_epochs=1, epoch_length=y_pred.shape[0])
 
-        assert set(state.metrics.keys()) == set([metric_name, ])
+        assert set(state.metrics.keys()) == set([metric_name,])
         np_y_pred = np.argmax(y_pred.numpy(), axis=-1).ravel()
         np_y = y.numpy().ravel()
         assert state.metrics[metric_name] == approx(compute_true_value_fn(np_y_pred, np_y))
@@ -390,7 +463,7 @@ def test_pytorch_operators():
     f1 = (precision * recall * 2 / (precision + recall + 1e-20)).mean()
 
     def compute_f1(y_pred, y):
-        f1 = f1_score(y, y_pred, average='macro')
+        f1 = f1_score(y, y_pred, average="macro")
         return f1
 
     _test(f1, "f1", compute_true_value_fn=compute_f1)
@@ -405,8 +478,7 @@ def test_indexing_metric():
             y_pred, y = batch
             return y_pred, y
 
-        metrics = {'metric': ignite_metric[index],
-                   'metric_wo_index': ignite_metric}
+        metrics = {"metric": ignite_metric[index], "metric_wo_index": ignite_metric}
 
         validator = Engine(update_fn)
 
@@ -418,43 +490,42 @@ def test_indexing_metric():
                 yield (y_pred[i], y[i])
 
         d = data(y_pred, y)
-        state = validator.run(d, max_epochs=1)
+        state = validator.run(d, max_epochs=1, epoch_length=y_pred.shape[0])
 
-        sklearn_output = sklearn_metic(y.view(-1).numpy(),
-                                       y_pred.view(-1, num_classes).argmax(dim=1).numpy(),
-                                       **sklearn_args)
+        sklearn_output = sklearn_metic(
+            y.view(-1).numpy(), y_pred.view(-1, num_classes).argmax(dim=1).numpy(), **sklearn_args
+        )
 
-        assert (state.metrics['metric_wo_index'][index] == state.metrics['metric']).all()
-        assert (np.allclose(state.metrics['metric'].numpy(), sklearn_output))
+        assert (state.metrics["metric_wo_index"][index] == state.metrics["metric"]).all()
+        assert np.allclose(state.metrics["metric"].numpy(), sklearn_output)
 
     num_classes = 5
 
     labels = list(range(0, num_classes, 2))
-    _test(Precision(), precision_score, {'labels': labels, 'average': None}, index=labels)
+    _test(Precision(), precision_score, {"labels": labels, "average": None}, index=labels)
     labels = list(range(num_classes - 1, 0, -2))
-    _test(Precision(), precision_score, {'labels': labels, 'average': None}, index=labels)
+    _test(Precision(), precision_score, {"labels": labels, "average": None}, index=labels)
     labels = [1]
-    _test(Precision(), precision_score, {'labels': labels, 'average': None}, index=labels)
+    _test(Precision(), precision_score, {"labels": labels, "average": None}, index=labels)
 
     labels = list(range(0, num_classes, 2))
-    _test(Recall(), recall_score, {'labels': labels, 'average': None}, index=labels)
+    _test(Recall(), recall_score, {"labels": labels, "average": None}, index=labels)
     labels = list(range(num_classes - 1, 0, -2))
-    _test(Recall(), recall_score, {'labels': labels, 'average': None}, index=labels)
+    _test(Recall(), recall_score, {"labels": labels, "average": None}, index=labels)
     labels = [1]
-    _test(Recall(), recall_score, {'labels': labels, 'average': None}, index=labels)
+    _test(Recall(), recall_score, {"labels": labels, "average": None}, index=labels)
 
     # np.ix_ is used to allow for a 2D slice of a matrix. This is required to get accurate result from
     # ConfusionMatrix. ConfusionMatrix must be sliced the same row-wise and column-wise.
     labels = list(range(0, num_classes, 2))
-    _test(ConfusionMatrix(num_classes), confusion_matrix, {'labels': labels}, index=np.ix_(labels, labels))
+    _test(ConfusionMatrix(num_classes), confusion_matrix, {"labels": labels}, index=np.ix_(labels, labels))
     labels = list(range(num_classes - 1, 0, -2))
-    _test(ConfusionMatrix(num_classes), confusion_matrix, {'labels': labels}, index=np.ix_(labels, labels))
+    _test(ConfusionMatrix(num_classes), confusion_matrix, {"labels": labels}, index=np.ix_(labels, labels))
     labels = [1]
-    _test(ConfusionMatrix(num_classes), confusion_matrix, {'labels': labels}, index=np.ix_(labels, labels))
+    _test(ConfusionMatrix(num_classes), confusion_matrix, {"labels": labels}, index=np.ix_(labels, labels))
 
 
-class DummyMetric(Metric):
-
+class DummyMetric2(Metric):
     @reinit__is_reduced
     def reset(self):
         pass
@@ -468,25 +539,26 @@ class DummyMetric(Metric):
 
 
 def test__sync_all_reduce():
-    m = DummyMetric()
+    m = DummyMetric2()
     res = m._sync_all_reduce(10)
     assert res == 10
 
 
 def _test_distrib__sync_all_reduce(device):
     import torch.distributed as dist
+
     assert dist.is_available() and dist.is_initialized()
 
-    m = DummyMetric(device=device)
+    m = DummyMetric2(device=device)
     res = m._sync_all_reduce(10)
     assert res == 10 * dist.get_world_size()
 
-    m = DummyMetric(device=device)
+    m = DummyMetric2(device=device)
     t = torch.tensor(10, device=device)
     res = m._sync_all_reduce(t)
     assert res.item() == 10 * dist.get_world_size()
 
-    m = DummyMetric(device=device)
+    m = DummyMetric2(device=device)
     with pytest.raises(TypeError, match=r"Unhandled input type"):
         m._sync_all_reduce("abc")
 
@@ -497,11 +569,10 @@ def _test_distrib_sync_all_reduce_decorator(device):
     from ignite.metrics.metric import sync_all_reduce, reinit__is_reduced
 
     class DummyMetric(Metric):
-
         @reinit__is_reduced
         def reset(self):
             self.a = torch.tensor([0.0, 1.0, 2.0, 3.0], device=self._device, requires_grad=False)
-            self.a_nocomp = self.a.clone().to('cpu')
+            self.a_nocomp = self.a.clone().to("cpu")
             self.b = torch.tensor(1.0, dtype=torch.float64, device=self._device, requires_grad=False)
             self.b_nocomp = self.b.clone().to("cpu")
             self.c = 0.0
@@ -548,7 +619,7 @@ def test_distrib_cpu(distributed_context_single_node_gloo):
 
 
 @pytest.mark.multinode_distributed
-@pytest.mark.skipif('MULTINODE_DISTRIB' not in os.environ, reason="Skip if not multi-node distributed")
+@pytest.mark.skipif("MULTINODE_DISTRIB" not in os.environ, reason="Skip if not multi-node distributed")
 def test_multinode_distrib_cpu(distributed_context_multi_node_gloo):
     device = "cpu"
     _test_distrib__sync_all_reduce(device)
@@ -556,8 +627,8 @@ def test_multinode_distrib_cpu(distributed_context_multi_node_gloo):
 
 
 @pytest.mark.multinode_distributed
-@pytest.mark.skipif('GPU_MULTINODE_DISTRIB' not in os.environ, reason="Skip if not multi-node distributed")
+@pytest.mark.skipif("GPU_MULTINODE_DISTRIB" not in os.environ, reason="Skip if not multi-node distributed")
 def test_multinode_distrib_gpu(distributed_context_multi_node_nccl):
-    device = "cuda:{}".format(distributed_context_multi_node_nccl['local_rank'])
+    device = "cuda:{}".format(distributed_context_multi_node_nccl["local_rank"])
     _test_distrib__sync_all_reduce(device)
     _test_distrib_sync_all_reduce_decorator(device)

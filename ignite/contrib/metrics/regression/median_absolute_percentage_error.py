@@ -1,5 +1,3 @@
-from __future__ import division
-
 import torch
 
 from ignite.contrib.metrics.regression._base import _BaseRegressionEpoch
@@ -20,7 +18,7 @@ class MedianAbsolutePercentageError(_BaseRegressionEpoch):
 
     More details can be found in `Botchkarev 2018`__.
 
-    - `update` must receive output of the form `(y_pred, y)`.
+    - `update` must receive output of the form `(y_pred, y)` or `{'y_pred': y_pred, 'y': y}`.
     - `y` and `y_pred` must be of same shape `(N, )` or `(N, 1)` and of type `float32`.
 
     .. warning::
@@ -32,6 +30,8 @@ class MedianAbsolutePercentageError(_BaseRegressionEpoch):
     __ https://arxiv.org/abs/1809.03006
 
     """
+
     def __init__(self, output_transform=lambda x: x):
-        super(MedianAbsolutePercentageError, self).__init__(median_absolute_percentage_error_compute_fn,
-                                                            output_transform)
+        super(MedianAbsolutePercentageError, self).__init__(
+            median_absolute_percentage_error_compute_fn, output_transform
+        )

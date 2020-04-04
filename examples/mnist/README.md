@@ -14,21 +14,22 @@ Run the example:
 python mnist.py
 ```
 
-### Logging with TensorboardX
+### Logging with Tensorboard
 
-MNIST example with training and validation monitoring using TensorboardX and Tensorboard.
+MNIST example with training and validation monitoring using Tensorboard. Notice 
+that if PyTorch version is less than 1.2, the module TensorboardX is required.
 
 #### Requirements:
 
 - [torchvision](https://github.com/pytorch/vision/): `pip install torchvision`
-- [TensorboardX](https://github.com/lanpa/tensorboard-pytorch): `pip install tensorboardX`
-- Tensorboard: `pip install tensorflow` (or just install tensorboard without the rest of tensorflow)
+- [TensorboardX](https://github.com/lanpa/tensorboard-pytorch) (if and only if `PyTorch <= 1.2`): `pip install tensorboardX`
+- Tensorboard: `pip install tensorboard`
 
 #### Usage:
 
 Run the example:
 ```bash
-python mnist_with_tensorboardx.py --log_dir=/tmp/tensorboard_logs
+python mnist_with_tensorboard.py --log_dir=/tmp/tensorboard_logs
 ```
 
 Start tensorboard:
@@ -56,3 +57,41 @@ Run the example:
 ```bash
 python mnist_with_visdom.py
 ```
+
+
+### Training save & resume
+
+Example shows how to save a checkpoint of the trainer, model, optimizer, lr scheduler. Training crash is emulated 
+and user can resume the training from the latest checkpoint.
+ 
+#### Requirements:
+
+- [torchvision](https://github.com/pytorch/vision/): `pip install torchvision`
+- [tqdm](https://github.com/tqdm/tqdm/): `pip install tqdm`
+- [TensorboardX](https://github.com/lanpa/tensorboard-pytorch): `pip install tensorboardX`
+- Tensorboard: `pip install tensorboard`
+
+#### Usage:
+
+Initial training with a crash
+```bash
+python mnist_save_resume_engine.py
+```
+
+Resume from the latest checkpoint
+```bash
+python mnist_save_resume_engine.py --resume_from /tmp/mnist_save_resume/checkpoint_<N>.pth
+```
+
+Training without crashing
+```bash
+python mnist_save_resume_engine.py --crash_iteration 100000
+```
+
+Start tensorboard:
+```bash
+tensorboard --logdir=/tmp/mnist_save_resume/
+```
+
+![tb1](assets/save_resume_p1.png)
+![tb2](assets/save_resume_p2.png)

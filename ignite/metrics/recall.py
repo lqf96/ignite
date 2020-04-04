@@ -1,4 +1,4 @@
-from __future__ import division
+from typing import Sequence, Callable, Optional, Union
 
 import torch
 
@@ -6,12 +6,14 @@ from ignite.metrics.precision import _BasePrecisionRecall
 from ignite.utils import to_onehot
 from ignite.metrics.metric import reinit__is_reduced
 
+__all__ = ["Recall"]
+
 
 class Recall(_BasePrecisionRecall):
     """
     Calculates recall for binary and multiclass data.
 
-    - `update` must receive output of the form `(y_pred, y)`.
+    - `update` must receive output of the form `(y_pred, y)` or `{'y_pred': y_pred, 'y': y}`.
     - `y_pred` must be in the following shape (batch_size, num_categories, ...) or (batch_size, ...).
     - `y` must be in the following shape (batch_size, ...).
 
@@ -65,12 +67,19 @@ class Recall(_BasePrecisionRecall):
 
     """
 
-    def __init__(self, output_transform=lambda x: x, average=False, is_multilabel=False, device=None):
-        super(Recall, self).__init__(output_transform=output_transform,
-                                     average=average, is_multilabel=is_multilabel, device=device)
+    def __init__(
+        self,
+        output_transform: Callable = lambda x: x,
+        average: bool = False,
+        is_multilabel: bool = False,
+        device: Optional[Union[str, torch.device]] = None,
+    ):
+        super(Recall, self).__init__(
+            output_transform=output_transform, average=average, is_multilabel=is_multilabel, device=device
+        )
 
     @reinit__is_reduced
-    def update(self, output):
+    def update(self, output: Sequence[torch.Tensor]) -> None:
         y_pred, y = output
         self._check_shape(output)
         self._check_type((y_pred, y))
@@ -81,8 +90,10 @@ class Recall(_BasePrecisionRecall):
         elif self._type == "multiclass":
             num_classes = y_pred.size(1)
             if y.max() + 1 > num_classes:
-                raise ValueError("y_pred contains less classes than y. Number of predicted classes is {}"
-                                 " and element in y has invalid class = {}.".format(num_classes, y.max().item() + 1))
+                raise ValueError(
+                    "y_pred contains less classes than y. Number of predicted classes is {}"
+                    " and element in y has invalid class = {}.".format(num_classes, y.max().item() + 1)
+                )
             y = to_onehot(y.view(-1), num_classes=num_classes)
             indices = torch.argmax(y_pred, dim=1).view(-1)
             y_pred = to_onehot(indices, num_classes=num_classes)

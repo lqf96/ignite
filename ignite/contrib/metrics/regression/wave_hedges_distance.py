@@ -1,5 +1,3 @@
-from __future__ import division
-
 import torch
 
 from ignite.contrib.metrics.regression._base import _BaseRegression
@@ -14,7 +12,7 @@ class WaveHedgesDistance(_BaseRegression):
 
     More details can be found in `Botchkarev 2018`__.
 
-    - `update` must receive output of the form `(y_pred, y)`.
+    - `update` must receive output of the form `(y_pred, y)` or `{'y_pred': y_pred, 'y': y}`.
     - `y` and `y_pred` must be of same shape `(N, )` or `(N, 1)`.
 
     __ https://arxiv.org/abs/1809.03006

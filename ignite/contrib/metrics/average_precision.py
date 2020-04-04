@@ -30,11 +30,12 @@ class AveragePrecision(EpochMetric):
 
         def activated_output_transform(output):
             y_pred, y = output
-            y_pred = torch.softmax(y_pred)
+            y_pred = torch.softmax(y_pred, dim=1)
             return y_pred, y
 
         avg_precision = AveragePrecision(activated_output_transform)
 
     """
+
     def __init__(self, output_transform=lambda x: x):
         super(AveragePrecision, self).__init__(average_precision_compute_fn, output_transform=output_transform)

@@ -1,26 +1,26 @@
 import numbers
 from abc import ABCMeta, abstractmethod
 from functools import wraps
+from collections.abc import Mapping
 import warnings
 
-try:
-    from collections.abc import Sequence
-except ImportError:  # Python 2.7 compatibility
-    from collections import Sequence
+from typing import Callable, Union, Optional, Any, Dict
 
 import torch
 import torch.distributed as dist
 
-from ignite._six import with_metaclass
-from ignite.engine import Events
+from ignite.engine import Events, EventEnum, Engine
 
+__all__ = ["Metric"]
+
+# Default trigger points for events
 DEFAULT_TRIGGER_EVENTS = {
-    "start": Events.EPOCH_STARTED,
+    "started": Events.EPOCH_STARTED,
     "update": Events.ITERATION_COMPLETED,
     "completed": Events.EPOCH_COMPLETED
 }
 
-class Metric(with_metaclass(ABCMeta, object)):
+class Metric(metaclass=ABCMeta):
     """
     Base class for all Metrics.
 
@@ -29,13 +29,17 @@ class Metric(with_metaclass(ABCMeta, object)):
             :class:`~ignite.engine.Engine`'s `process_function`'s output into the
             form expected by the metric. This can be useful if, for example, you have a multi-output model and
             you want to compute the metric with respect to one of the outputs.
+            By default, metrics require the output as `(y_pred, y)` or `{'y_pred': y_pred, 'y': y}`.
         device (str of torch.device, optional): device specification in case of distributed computation usage.
             In most of the cases, it can be defined as "cuda:local_rank" or "cuda"
             if already set `torch.cuda.set_device(local_rank)`. By default, if a distributed process group is
             initialized and available, device is set to `cuda`.
     """
 
-    def __init__(self, output_transform=lambda x: x, device=None, trigger_events=DEFAULT_TRIGGER_EVENTS):
+    _required_output_keys = ("y_pred", "y")
+
+    def __init__(self, output_transform: Callable = lambda x: x, device: Optional[Union[str, torch.device]] = None,
+        trigger_events: Dict[str, EventEnum] = DEFAULT_TRIGGER_EVENTS):
         self._output_transform = output_transform
 
         # Convert trigger events to dictionary
@@ -50,9 +54,11 @@ class Metric(with_metaclass(ABCMeta, object)):
 
             # check if reset and update methods are decorated. Compute may not be decorated
             if not (hasattr(self.reset, "_decorated") and hasattr(self.update, "_decorated")):
-                warnings.warn("{} class does not support distributed setting. Computed result is not collected "
-                              "across all computing devices".format(self.__class__.__name__),
-                              RuntimeWarning)
+                warnings.warn(
+                    "{} class does not support distributed setting. Computed result is not collected "
+                    "across all computing devices".format(self.__class__.__name__),
+                    RuntimeWarning,
+                )
             if device is None:
                 device = "cuda"
             device = torch.device(device)
@@ -62,7 +68,8 @@ class Metric(with_metaclass(ABCMeta, object)):
         self._trigger_events = trigger_events
         self.reset()
 
-    def reset(self):
+    @abstractmethod
+    def reset(self) -> None:
         """
         Resets the metric to its initial state.
 
@@ -71,7 +78,7 @@ class Metric(with_metaclass(ABCMeta, object)):
         pass
 
     @abstractmethod
-    def update(self, output):
+    def update(self, output) -> None:
         """
         Updates the metric's state using the passed batch output.
 
@@ -83,7 +90,7 @@ class Metric(with_metaclass(ABCMeta, object)):
         pass
 
     @abstractmethod
-    def compute(self):
+    def compute(self) -> Any:
         """
         Computes the metric based on it's accumulated state.
 
@@ -97,7 +104,7 @@ class Metric(with_metaclass(ABCMeta, object)):
         """
         pass
 
-    def _sync_all_reduce(self, tensor):
+    def _sync_all_reduce(self, tensor: Union[torch.Tensor, numbers.Number]) -> Union[torch.Tensor, numbers.Number]:
         if not (dist.is_available() and dist.is_initialized()):
             # Nothing to reduce
             return tensor
@@ -122,99 +129,185 @@ class Metric(with_metaclass(ABCMeta, object)):
             return tensor.item()
         return tensor
 
-    def on_engine_start(self, engine, name):
-        # Store metrics metadata to engine state
-        engine.state.metrics_meta[name] = {
-            "trigger_events": self._trigger_events
-        }
-
-    def on_start(self, engine):
+    def started(self, engine: Engine) -> None:
         self.reset()
 
     @torch.no_grad()
-    def on_update(self, engine):
+    def on_update(self, engine: Engine) -> None:
         output = self._output_transform(engine.state.output)
+        if isinstance(output, Mapping):
+            if self._required_output_keys is None:
+                raise TypeError(
+                    "Transformed engine output for {} metric should be a tuple/list, but given {}".format(
+                        self.__class__.__name__, type(output)
+                    )
+                )
+            if not all([k in output for k in self._required_output_keys]):
+                raise ValueError(
+                    "When transformed engine's output is a mapping, "
+                    "it should contain {} keys, but given {}".format(self._required_output_keys, list(output.keys()))
+                )
+            output = tuple(output[k] for k in self._required_output_keys)
         self.update(output)
 
-    def on_completed(self, engine, name):
+    def completed(self, engine: Engine, name: str) -> None:
         result = self.compute()
         if torch.is_tensor(result) and len(result.shape) == 0:
             result = result.item()
         engine.state.metrics[name] = result
 
-    def attach(self, engine, name):
+    def attach(self, engine: Engine, name: str) -> None:
+        """
+        Attaches current metric to provided engine. On the end of engine's run,
+        `engine.state.metrics` dictionary will contain computed metric's value under provided name.
+
+        Args:
+            engine (Engine): the engine to which the metric must be attached
+            name (str): the name of the metric to attach
+
+        Example:
+
+        .. code-block:: python
+
+            metric = ...
+            metric.attach(engine, "mymetric")
+
+            assert "mymetric" in engine.run(data).metrics
+
+            assert metric.is_attached(engine)
+        """
+        # Triggering points for events
         completed_event = self._trigger_events["completed"]
         update_event = self._trigger_events.get("update", completed_event)
-        started_event = self._trigger_events.get("start")
-        
-        # Handle engine started event
-        engine.add_event_handler(Events.STARTED, self.on_engine_start, name)
-        # Handle started event
-        if started_event and not engine.has_event_handler(self.on_start, started_event):
-            engine.add_event_handler(started_event, self.on_start)
-        # Handle update event
+        started_event = self._trigger_events.get("started")
+
+        # Handle period started event
+        if started_event!=None and not engine.has_event_handler(self.started, started_event):
+            engine.add_event_handler(started_event, self.started)
+        # Handle period update event
         if not engine.has_event_handler(self.on_update, update_event):
             engine.add_event_handler(update_event, self.on_update)
-        # Handle completed event
-        engine.add_event_handler(completed_event, self.on_completed, name)
+        # Handle period completed event
+        engine.add_event_handler(completed_event, self.completed, name)
+
+    def detach(self, engine: Engine) -> None:
+        """
+        Detaches current metric from the engine and no metric's computation is done during the run.
+        This method in conjunction with :meth:`~ignite.metrics.Metric.attach` can be useful if several
+        metrics need to be computed with different periods. For example, one metric is computed every training epoch
+        and another metric (e.g. more expensive one) is done every n-th training epoch.
+
+        Args:
+            engine (Engine): the engine from which the metric must be detached
+
+        Example:
+
+        .. code-block:: python
+
+            metric = ...
+            engine = ...
+            metric.detach(engine)
+
+            assert "mymetric" not in engine.run(data).metrics
+
+            assert not metric.is_attached(engine)
+        """
+        # Triggering points for events
+        completed_event = self._trigger_events["completed"]
+        update_event = self._trigger_events.get("update", completed_event)
+        started_event = self._trigger_events.get("started")
+
+        # Remove period completed event handler
+        if engine.has_event_handler(self.completed, completed_event):
+            engine.remove_event_handler(self.completed, completed_event)
+        # Remove period started event handler
+        if started_event!=None and engine.has_event_handler(self.started, started_event):
+            engine.remove_event_handler(self.started, started_event)
+        # Remove period completed event handler
+        if engine.has_event_handler(self.on_update, update_event):
+            engine.remove_event_handler(self.on_update, update_event)
+
+    def is_attached(self, engine: Engine) -> bool:
+        """
+        Checks if current metric is attached to provided engine. If attached, metric's computed
+        value is written to `engine.state.metrics` dictionary.
+
+        Args:
+            engine (Engine): the engine checked from which the metric should be attached
+        """
+        return engine.has_event_handler(self.completed, Events.EPOCH_COMPLETED)
 
     def __add__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x + y, self, other)
 
     def __radd__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x + y, other, self)
 
     def __sub__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x - y, self, other)
 
     def __rsub__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x - y, other, self)
 
     def __mul__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x * y, self, other)
 
     def __rmul__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x * y, other, self)
 
     def __pow__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x ** y, self, other)
 
     def __rpow__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x ** y, other, self)
 
     def __mod__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x % y, self, other)
 
     def __div__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x.__div__(y), self, other)
 
     def __rdiv__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x.__div__(y), other, self)
 
     def __truediv__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x.__truediv__(y), self, other)
 
     def __rtruediv__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x.__truediv__(y), other, self)
 
     def __floordiv__(self, other):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x, y: x // y, self, other)
 
-    def __getattr__(self, attr):
+    def __getattr__(self, attr: str) -> Callable:
         from ignite.metrics import MetricsLambda
 
         def fn(x, *args, **kwargs):
@@ -222,22 +315,23 @@ class Metric(with_metaclass(ABCMeta, object)):
 
         def wrapper(*args, **kwargs):
             return MetricsLambda(fn, self, *args, **kwargs)
+
         return wrapper
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: Any):
         from ignite.metrics import MetricsLambda
+
         return MetricsLambda(lambda x: x[index], self)
 
 
-def sync_all_reduce(*attrs):
-
-    def wrapper(func):
-
+def sync_all_reduce(*attrs) -> Callable:
+    def wrapper(func: Callable) -> Callable:
         @wraps(func)
-        def another_wrapper(self, *args, **kwargs):
+        def another_wrapper(self: Metric, *args, **kwargs) -> Callable:
             if not isinstance(self, Metric):
-                raise RuntimeError("Decorator sync_all_reduce should be used on "
-                                   "ignite.metric.Metric class methods only")
+                raise RuntimeError(
+                    "Decorator sync_all_reduce should be used on " "ignite.metric.Metric class methods only"
+                )
 
             if len(attrs) > 0 and not self._is_reduced:
                 for attr in attrs:
@@ -255,8 +349,7 @@ def sync_all_reduce(*attrs):
     return wrapper
 
 
-def reinit__is_reduced(func):
-
+def reinit__is_reduced(func: Callable) -> Callable:
     @wraps(func)
     def wrapper(self, *args, **kwargs):
         func(self, *args, **kwargs)

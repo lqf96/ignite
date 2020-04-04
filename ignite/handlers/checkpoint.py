@@ -1,23 +1,21 @@
 import os
 import tempfile
+import numbers
+
 from collections import namedtuple
+import collections.abc as collections
 import warnings
 
-import sys
-
-IS_PYTHON2 = sys.version_info[0] < 3
-
-if IS_PYTHON2:
-    import collections
-else:
-    import collections.abc as collections
+from typing import Optional, Callable, Mapping, Union
 
 import torch
 
-from ignite.engine import Events
+from ignite.engine import Events, Engine
+
+__all__ = ["Checkpoint", "DiskSaver", "ModelCheckpoint"]
 
 
-class Checkpoint(object):
+class Checkpoint:
     """Checkpoint handler can be used to periodically save and load objects which have attribute
     `state_dict`/`load_state_dict`. This class can use specific save handlers to store on the disk or a cloud
     storage, etc.
@@ -32,9 +30,10 @@ class Checkpoint(object):
         score_function (callable, optional): If not None, it should be a function taking a single argument,
             :class:`~ignite.engine.Engine` object, and returning a score (`float`). Objects with highest scores will be
             retained.
-        score_name (str, optional): If `score_function` not None, it is possible to store its absolute value using
+        score_name (str, optional): If `score_function` not None, it is possible to store its value using
             `score_name`. See Notes for more details.
-        n_saved (int, optional): Number of objects that should be kept on disk. Older files will be removed.
+        n_saved (int, optional): Number of objects that should be kept on disk. Older files will be removed. If set to
+            `None`, all objects are kept.
         global_step_transform (callable, optional): global step transform function to output a desired global step.
             Input of the function is `(engine, event_name)`. Output of function should be an integer.
             Default is None, global_step based on attached engine. If provided, uses function output as global_step.
@@ -61,11 +60,11 @@ class Checkpoint(object):
         The filename will be `{filename_prefix}_{name}_{global_step}_{score}.pth`.
 
         If defined `score_function` and `score_name`, then the filename will
-        be `{filename_prefix}_{name}_{score_name}={abs(score)}.{ext}`. If `global_step_transform` is provided, then
-        the filename will be `{filename_prefix}_{name}_{global_step}_{score_name}={abs(score)}.{ext}`
+        be `{filename_prefix}_{name}_{score_name}={score}.{ext}`. If `global_step_transform` is provided, then
+        the filename will be `{filename_prefix}_{name}_{global_step}_{score_name}={score}.{ext}`
 
-        For example, `score_name="val_loss"` and `score_function` that returns `-loss` (as objects with
-        highest scores will be retained), then saved filename will be `{filename_prefix}_{name}_val_loss=0.1234.pth`.
+        For example, `score_name="neg_val_loss"` and `score_function` that returns `-loss` (as objects with highest
+        scores will be retained), then saved filename will be `{filename_prefix}_{name}_neg_val_loss=-0.1234.pth`.
 
         To get the last stored filename, handler exposes attribute `last_checkpoint`:
 
@@ -90,7 +89,7 @@ class Checkpoint(object):
             optimizer = ...
             lr_scheduler = ...
 
-            to_save = {'model': model, 'optimizer': optimizer, 'lr_scheduler': lr_scheduler}
+            to_save = {'model': model, 'optimizer': optimizer, 'lr_scheduler': lr_scheduler, 'trainer': trainer}
             handler = Checkpoint(to_save, DiskSaver('/tmp/models', create_dir=True), n_saved=2)
             trainer.add_event_handler(Events.ITERATION_COMPLETED(every=1000), handler)
             trainer.run(data_loader, max_epochs=6)
@@ -106,9 +105,12 @@ class Checkpoint(object):
 
             trainer = ...
             evaluator = ...
+            # Setup Accuracy metric computation on evaluator
+            # Run evaluation on epoch completed event
+            # ...
 
             def score_function(engine):
-                engine.state.metrics['accuracy']
+                return engine.state.metrics['accuracy']
 
             to_save = {'model': model}
             handler = Checkpoint(to_save, DiskSaver('/tmp/models', create_dir=True), n_saved=2,
@@ -116,6 +118,7 @@ class Checkpoint(object):
                                  global_step_transform=global_step_from_engine(trainer))
 
             evaluator.add_event_handler(Events.COMPLETED, handler)
+
             trainer.run(data_loader, max_epochs=10)
             > ["best_model_9_val_acc=0.77.pth", "best_model_10_val_acc=0.78.pth", ]
 
@@ -123,9 +126,17 @@ class Checkpoint(object):
 
     Item = namedtuple("Item", ["priority", "filename"])
 
-    def __init__(self, to_save, save_handler, filename_prefix="",
-                 score_function=None, score_name=None, n_saved=1,
-                 global_step_transform=None, archived=False):
+    def __init__(
+        self,
+        to_save: Mapping,
+        save_handler: Callable,
+        filename_prefix: str = "",
+        score_function: Optional[Callable] = None,
+        score_name: Optional[str] = None,
+        n_saved: Optional[int] = 1,
+        global_step_transform: Callable = None,
+        archived: bool = False,
+    ):
 
         if not isinstance(to_save, collections.Mapping):
             raise TypeError("Argument `to_save` should be a dictionary, but given {}".format(type(to_save)))
@@ -137,14 +148,14 @@ class Checkpoint(object):
             raise TypeError("Argument `save_handler` should be callable")
 
         if score_function is None and score_name is not None:
-            raise ValueError("If `score_name` is provided, then `score_function` "
-                             "should be also provided.")
+            raise ValueError("If `score_name` is provided, then `score_function` " "should be also provided.")
 
         if global_step_transform is not None and not callable(global_step_transform):
-            raise TypeError("global_step_transform should be a function, got {} instead."
-                            .format(type(global_step_transform)))
+            raise TypeError(
+                "global_step_transform should be a function, got {} instead.".format(type(global_step_transform))
+            )
 
-        self._check_objects(to_save)
+        self._check_objects(to_save, "state_dict")
         self._fname_prefix = filename_prefix + "_" if len(filename_prefix) > 0 else filename_prefix
         self.save_handler = save_handler
         self.to_save = to_save
@@ -156,12 +167,17 @@ class Checkpoint(object):
         self.global_step_transform = global_step_transform
 
     @property
-    def last_checkpoint(self):
+    def last_checkpoint(self) -> str:
         if len(self._saved) < 1:
             return None
-        return self._saved[0].filename
+        return self._saved[-1].filename
 
-    def __call__(self, engine):
+    def _check_lt_n_saved(self, or_equal=False):
+        if self._n_saved is None:
+            return True
+        return len(self._saved) < self._n_saved + int(or_equal)
+
+    def __call__(self, engine: Engine) -> None:
 
         suffix = ""
         if self.global_step_transform is not None:
@@ -170,22 +186,27 @@ class Checkpoint(object):
 
         if self._score_function is not None:
             priority = self._score_function(engine)
+            if not isinstance(priority, numbers.Number):
+                raise ValueError("Output of score_function should be a number")
         else:
             priority = engine.state.get_event_attrib_value(Events.ITERATION_COMPLETED)
 
-        if len(self._saved) < self._n_saved or \
-                self._saved[0].priority < priority:
+        if self._check_lt_n_saved() or self._saved[0].priority < priority:
+
+            priority_str = (
+                "{}".format(priority) if isinstance(priority, numbers.Integral) else "{:.4f}".format(priority)
+            )
 
             if self._score_name is not None:
                 if len(suffix) > 0:
                     suffix += "_"
-                suffix = "{}{}={}".format(suffix, self._score_name, priority)
+                suffix = "{}{}={}".format(suffix, self._score_name, priority_str)
             elif self._score_function is not None:
                 if len(suffix) > 0:
                     suffix += "_"
-                suffix = "{}{}".format(suffix, priority)
+                suffix = "{}{}".format(suffix, priority_str)
             elif len(suffix) == 0:
-                suffix = "{}".format(priority)
+                suffix = "{}".format(priority_str)
 
             checkpoint = self._setup_checkpoint()
 
@@ -194,47 +215,70 @@ class Checkpoint(object):
                 for k in checkpoint:
                     name = k
                 checkpoint = checkpoint[name]
-            filename = '{}{}_{}{}'.format(self._fname_prefix, name, suffix, self._ext)
+            filename = "{}{}_{}{}".format(self._fname_prefix, name, suffix, self._ext)
+
+            if any(item.filename == filename for item in self._saved):
+                return
 
             self.save_handler(checkpoint, filename)
 
             self._saved.append(Checkpoint.Item(priority, filename))
             self._saved.sort(key=lambda item: item[0])
 
-        if len(self._saved) > self._n_saved:
+        if not self._check_lt_n_saved(or_equal=True):
             item = self._saved.pop(0)
             self.save_handler.remove(item.filename)
 
-    def _setup_checkpoint(self):
+    def _setup_checkpoint(self) -> dict:
         checkpoint = {}
         for k, obj in self.to_save.items():
             checkpoint[k] = obj.state_dict()
         return checkpoint
 
     @staticmethod
-    def _check_objects(to_save_or_load):
-        for k, obj in to_save_or_load.items():
-            if not (hasattr(obj, "state_dict") and hasattr(obj, "load_state_dict")):
-                raise TypeError("Object {} should have `state_dict` and `load_state_dict` methods".format(type(obj)))
+    def _check_objects(objs: Mapping, attr: str) -> None:
+        for k, obj in objs.items():
+            if not hasattr(obj, attr):
+                raise TypeError("Object {} should have `{}` method".format(type(obj), attr))
 
     @staticmethod
-    def load_objects(to_load, checkpoint):
-        """Method to apply `load_state_dict` on the objects from `to_load` using states from `checkpoint`.
+    def load_objects(to_load: Mapping, checkpoint: Mapping, **kwargs) -> None:
+        """Helper method to apply `load_state_dict` on the objects from `to_load` using states from `checkpoint`.
 
         Args:
-            to_load (Mapping):
-            checkpoint (Mapping):
+            to_load (Mapping): a dictionary with objects, e.g. `{"model": model, "optimizer": optimizer, ...}`
+            checkpoint (Mapping): a dictionary with state_dicts to load, e.g. `{"model": model_state_dict,
+                "optimizer": opt_state_dict}`. If `to_load` contains a single key, then checkpoint can contain directly
+                corresponding state_dict.
+            **kwargs: Keyword arguments accepted for `nn.Module.load_state_dict()`. Passing `strict=False` enables
+                the user to load part of the pretrained model (useful for example, in Transfer Learning)
         """
-        Checkpoint._check_objects(to_load)
+        Checkpoint._check_objects(to_load, "load_state_dict")
         if not isinstance(checkpoint, collections.Mapping):
             raise TypeError("Argument checkpoint should be a dictionary, but given {}".format(type(checkpoint)))
+
+        if len(kwargs) > 1 or any(k for k in kwargs.keys() if k not in ["strict"]):
+            warnings.warn("kwargs contains keys other than strict and these will be ignored")
+
+        is_state_dict_strict = kwargs.get("strict", True)
+        if len(to_load) == 1:
+            # single object and checkpoint is directly a state_dict
+            key, obj = list(to_load.items())[0]
+            if key not in checkpoint:
+                obj.load_state_dict(checkpoint, strict=is_state_dict_strict)
+                return
+
+        # multiple objects to load
         for k, obj in to_load.items():
             if k not in checkpoint:
                 raise ValueError("Object labeled by '{}' from `to_load` is not found in the checkpoint".format(k))
-            obj.load_state_dict(checkpoint[k])
+            if isinstance(obj, torch.nn.Module):
+                obj.load_state_dict(checkpoint[k], strict=is_state_dict_strict)
+            else:
+                obj.load_state_dict(checkpoint[k])
 
 
-class DiskSaver(object):
+class DiskSaver:
     """Handler that saves input checkpoint on a disk.
 
     Args:
@@ -246,7 +290,7 @@ class DiskSaver(object):
         require_empty (bool, optional): If True, will raise exception if there are any files in the directory 'dirname'.
     """
 
-    def __init__(self, dirname, atomic=True, create_dir=True, require_empty=True):
+    def __init__(self, dirname: str, atomic: bool = True, create_dir: bool = True, require_empty: bool = True):
         self.dirname = os.path.expanduser(dirname)
         self._atomic = atomic
         if create_dir:
@@ -259,12 +303,14 @@ class DiskSaver(object):
         if require_empty:
             matched = [fname for fname in os.listdir(dirname) if fname.endswith(".pth") or fname.endswith(".pth.tar")]
             if len(matched) > 0:
-                raise ValueError("Files {} with extension '.pth' or '.pth.tar' are already present "
-                                 "in the directory {}. If you want to use this "
-                                 "directory anyway, pass `require_empty=False`."
-                                 "".format(matched, dirname))
+                raise ValueError(
+                    "Files {} with extension '.pth' or '.pth.tar' are already present "
+                    "in the directory {}. If you want to use this "
+                    "directory anyway, pass `require_empty=False`."
+                    "".format(matched, dirname)
+                )
 
-    def __call__(self, checkpoint, filename):
+    def __call__(self, checkpoint: Mapping, filename: str) -> None:
         path = os.path.join(self.dirname, filename)
 
         if not self._atomic:
@@ -281,13 +327,14 @@ class DiskSaver(object):
                 tmp.close()
                 os.rename(tmp.name, path)
 
-    def remove(self, filename):
+    def remove(self, filename: str) -> None:
         path = os.path.join(self.dirname, filename)
         os.remove(path)
 
 
 class ModelCheckpoint(Checkpoint):
-    """ModelCheckpoint handler can be used to periodically save objects to disk.
+    """ModelCheckpoint handler can be used to periodically save objects to disk only. If needed to store checkpoints to
+    another storage type, please consider :class:`~ignite.handlers.checkpoint.Checkpoint`.
 
     This handler expects two arguments:
 
@@ -319,9 +366,10 @@ class ModelCheckpoint(Checkpoint):
         score_function (callable, optional): if not None, it should be a function taking a single argument, an
             :class:`~ignite.engine.Engine` object, and return a score (`float`). Objects with highest scores will be
             retained.
-        score_name (str, optional): if `score_function` not None, it is possible to store its absolute value using
+        score_name (str, optional): if `score_function` not None, it is possible to store its value using
             `score_name`. See Notes for more details.
-        n_saved (int, optional): Number of objects that should be kept on disk. Older files will be removed.
+        n_saved (int, optional): Number of objects that should be kept on disk. Older files will be removed. If set to
+            `None`, all objects are kept.
         atomic (bool, optional): If True, objects are serialized to a temporary file, and then moved to final
             destination, so that files are guaranteed to not be damaged (for example if exception
             occurs during saving).
@@ -350,19 +398,29 @@ class ModelCheckpoint(Checkpoint):
         ['/tmp/models/myprefix_mymodel_6.pth']
     """
 
-    def __init__(self, dirname, filename_prefix,
-                 save_interval=None,
-                 score_function=None, score_name=None,
-                 n_saved=1,
-                 atomic=True, require_empty=True,
-                 create_dir=True,
-                 save_as_state_dict=True, global_step_transform=None, archived=False):
+    def __init__(
+        self,
+        dirname: str,
+        filename_prefix: str,
+        save_interval: Optional[Callable] = None,
+        score_function: Optional[Callable] = None,
+        score_name: Optional[str] = None,
+        n_saved: int = 1,
+        atomic: bool = True,
+        require_empty: bool = True,
+        create_dir: bool = True,
+        save_as_state_dict: bool = True,
+        global_step_transform: Optional[Callable] = None,
+        archived: bool = False,
+    ):
 
         if not save_as_state_dict:
             raise ValueError("Argument save_as_state_dict is deprecated and should be True")
         if save_interval is not None:
-            msg = "Argument save_interval is deprecated and should be None. " \
-                  "Please, use events filtering instead, e.g. Events.ITERATION_STARTED(every=1000)"
+            msg = (
+                "Argument save_interval is deprecated and should be None. "
+                "Please, use events filtering instead, e.g. Events.ITERATION_STARTED(every=1000)"
+            )
             if save_interval == 1:
                 # Do not break for old version who used `save_interval=1`
                 warnings.warn(msg)
@@ -373,12 +431,12 @@ class ModelCheckpoint(Checkpoint):
         disk_saver = DiskSaver(dirname, atomic=atomic, create_dir=create_dir, require_empty=require_empty)
 
         if score_function is None and score_name is not None:
-            raise ValueError("If `score_name` is provided, then `score_function` "
-                             "should be also provided.")
+            raise ValueError("If `score_name` is provided, then `score_function` " "should be also provided.")
 
         if global_step_transform is not None and not callable(global_step_transform):
-            raise TypeError("global_step_transform should be a function, got {} instead."
-                            .format(type(global_step_transform)))
+            raise TypeError(
+                "global_step_transform should be a function, got {} instead.".format(type(global_step_transform))
+            )
 
         self._fname_prefix = filename_prefix + "_" if len(filename_prefix) > 0 else filename_prefix
         self.save_handler = disk_saver
@@ -391,16 +449,16 @@ class ModelCheckpoint(Checkpoint):
         self.global_step_transform = global_step_transform
 
     @property
-    def last_checkpoint(self):
+    def last_checkpoint(self) -> Union[str, None]:
         if len(self._saved) < 1:
             return None
-        return os.path.join(self.save_handler.dirname, self._saved[0].filename)
+        return os.path.join(self.save_handler.dirname, self._saved[-1].filename)
 
-    def __call__(self, engine, to_save):
+    def __call__(self, engine: Engine, to_save: Mapping) -> None:
 
         if len(to_save) == 0:
             raise RuntimeError("No objects to checkpoint found.")
 
-        self._check_objects(to_save)
+        self._check_objects(to_save, "state_dict")
         self.to_save = to_save
         super(ModelCheckpoint, self).__call__(engine)
