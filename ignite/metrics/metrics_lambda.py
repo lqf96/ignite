@@ -76,7 +76,7 @@ class MetricsLambda(Metric):
             if sub_trigger_events is None:
                 sub_trigger_events = trigger_events
             else:
-                if trigger_events!=sub_trigger_events:
+                if trigger_events != sub_trigger_events:
                     raise ValueError("triggering points of all sub-metrics must be the same")
 
         self.function = f
@@ -119,7 +119,7 @@ class MetricsLambda(Metric):
                 # We must not use is_attached() but rather if these events exist
 
                 # Handle started event
-                if started_event!=None and not engine.has_event_handler(metric.started, started_event):
+                if started_event is not None and not engine.has_event_handler(metric.started, started_event):
                     engine.add_event_handler(started_event, metric.started)
                 # Handle update event
                 if not engine.has_event_handler(metric.on_update, update_event):
@@ -159,7 +159,7 @@ class MetricsLambda(Metric):
                 update_event = self._trigger_events.get("update", completed_event)
                 started_event = self._trigger_events.get("started")
 
-                if started_event!=None and not engine.has_event_handler(metric.started, started_event):
+                if started_event is not None and not engine.has_event_handler(metric.started, started_event):
                     is_detached = True
                 if not engine.has_event_handler(metric.on_update, update_event):
                     is_detached = True
